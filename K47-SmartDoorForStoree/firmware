@@ -1,1 +1,267 @@
-bguhbgh
+#include <SPI.h>
+#include <MFRC522.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <ESP32Servo.h>
+#include "DHT.h"
+#include <WiFi.h>
+#include <FirebaseESP32.h>
+
+// --- CẤU HÌNH CHÂN CẮM ---
+const String MASTER_UID = "93 80 7D 28"; 
+#define DHTPIN 4     
+#define DHTTYPE DHT22 
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define SS_PIN 5
+#define RST_PIN 13
+#define MQ2_PIN 33
+#define BUZZER_PIN 32 
+#define PIR_PIN 14
+#define SERVO1_PIN 25
+#define SERVO2_PIN 27
+
+// --- CẤU HÌNH FIREBASE & WIFI ---
+#define WIFI_SSID "phong" // <-- Thay tên WiFi của bạn vào đây
+#define WIFI_PASSWORD "12345678" // <-- Thay mật khẩu WiFi của bạn vào đây
+#define API_KEY "AIzaSyDg3ARe9fBJo1p6cbBePxYhX1pZPLJPgQ0"
+#define DATABASE_URL "https://appesp32-f74fb-default-rtdb.asia-southeast1.firebasedatabase.app/"
+
+// Khởi tạo đối tượng
+DHT dht(DHTPIN, DHTTYPE);
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+MFRC522 rfid(SS_PIN, RST_PIN);
+Servo servo1, servo2;
+
+FirebaseData fbdo;
+FirebaseAuth auth;
+FirebaseConfig config;
+FirebaseData streamData;
+
+// Biến điều khiển
+int gasThreshold = 1200; 
+bool pirEnabled = true;  
+bool isGasAlert = false;
+int posOpen = 90;    
+int posClosed = 0;   
+
+unsigned long lastMotionTime = 0; 
+const unsigned long delayTime = 4000; 
+bool isDoorOpenByPIR = false;
+bool appControlOpen = false;
+int totalGuests = 0;
+
+// Hàm cập nhật màn hình
+void updateDisplay(float t, float h, int g) {
+  display.clearDisplay();
+  display.setTextColor(WHITE);
+  display.setTextSize(1);
+  
+  display.setCursor(0, 0);
+  display.print("HE THONG: "); display.println(pirEnabled ? "HOAT DONG" : "DANG KHOA");
+  display.drawFastHLine(0, 10, 128, WHITE);
+
+  display.setCursor(0, 15);
+  display.printf("NHIET DO: %.1f C\n", isnan(t) ? 0 : t);
+  display.printf("DO AM:    %.1f %%\n", isnan(h) ? 0 : h);
+  display.printf("KHI GAS:  %d\n", g);
+  
+  display.setCursor(0, 48);
+  if (isGasAlert) {
+    display.setTextSize(1); // Chỉnh lại cỡ chữ nhỏ hơn để hiển thị đủ dòng cảnh báo
+    display.println("!!NGUY HIEM CO CHAY!!");
+    display.invertDisplay(true);
+  } else if (isDoorOpenByPIR) {
+    long remain = (delayTime - (millis() - lastMotionTime)) / 1000;
+    if (remain < 0) remain = 0;
+    display.print("XIN MOI VAO: "); display.print(remain); display.println("s");
+    display.invertDisplay(false);
+  } else {
+    display.println("AN TOAN");
+    display.invertDisplay(false);
+  }
+  display.display();
+}
+
+void streamCallback(StreamData data) {
+  String path = data.dataPath();
+  // Paths are relative to the streamed node "/NhaThongMinh"
+  if (path == "/DieuKhien/MoCua") {
+    appControlOpen = data.boolData();
+    if (appControlOpen) {
+      servo1.write(posOpen);
+      servo2.write(180 - posOpen);
+    } else if (!isDoorOpenByPIR) { // Nếu tắt từ App và PIR không giữ cửa -> Đóng
+      servo1.write(posClosed);
+      servo2.write(180 - posClosed);
+    }
+  } else if (path == "/DieuKhien/BatPIR") {
+    pirEnabled = data.boolData();
+  } else if (path == "/TongKhach") {
+    if (data.dataType() == "int") {
+      totalGuests = data.intData();
+    }
+  }
+}
+
+void streamTimeoutCallback(bool timeout) {}
+
+void setup() {
+  Serial.begin(115200);
+  if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) { 
+    Serial.println(F("OLED fail"));
+    for(;;); 
+  }
+  display.clearDisplay();
+  display.setCursor(0,20);
+  display.setTextColor(WHITE);
+  display.println("KHOI DONG...");
+  display.display();
+
+  pinMode(BUZZER_PIN, OUTPUT);
+  pinMode(PIR_PIN, INPUT_PULLDOWN); 
+  
+  dht.begin();
+  SPI.begin();
+  rfid.PCD_Init();
+  
+  servo1.attach(SERVO1_PIN);
+  servo2.attach(SERVO2_PIN);
+  servo1.write(posClosed);
+  servo2.write(180 - posClosed);
+
+  // --- KẾT NỐI WIFI & FIREBASE ---
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  Serial.print("Dang ket noi WiFi");
+  while (WiFi.status() != WL_CONNECTED) {
+    Serial.print(".");
+    delay(500);
+  }
+  Serial.println("\nDa ket noi WiFi");
+
+  config.api_key = API_KEY;
+  config.database_url = DATABASE_URL;
+  
+  Firebase.signUp(&config, &auth, "", ""); // Đăng nhập ẩn danh (Anonymous)
+  Firebase.begin(&config, &auth);
+  Firebase.reconnectWiFi(true);
+
+  // Lấy số lượng khách cũ từ Firebase (nếu có) để không bị reset về 0
+  if (Firebase.getInt(fbdo, "/NhaThongMinh/TongKhach")) {
+    if (fbdo.dataType() == "int") {
+        totalGuests = fbdo.intData();
+    }
+  }
+
+  // Stream từ node cha để lắng nghe cả /DieuKhien và /TongKhach
+  if (!Firebase.beginStream(streamData, "/NhaThongMinh")) {
+    Serial.println("Stream error: " + streamData.errorReason());
+  }
+  Firebase.setStreamCallback(streamData, streamCallback, streamTimeoutCallback);
+  
+  // Đảm bảo trạng thái trên App là Đóng khi khởi động lại (mất điện)
+  Firebase.setBool(fbdo, "/NhaThongMinh/DieuKhien/MoCua", false);
+
+  Serial.println("He thong san sang!");
+}
+
+void loop() {
+  // --- 1. XỬ LÝ RFID ---
+  if (rfid.PICC_IsNewCardPresent() && rfid.PICC_ReadCardSerial()) {
+    String scannedUID = "";
+    for (byte i = 0; i < rfid.uid.size; i++) {
+      scannedUID += (rfid.uid.uidByte[i] < 0x10 ? " 0" : " ");
+      scannedUID += String(rfid.uid.uidByte[i], HEX);
+    }
+    scannedUID.toUpperCase();
+    scannedUID.trim();
+
+    if (scannedUID == MASTER_UID) {
+      pirEnabled = !pirEnabled;
+      // Cập nhật trạng thái điều khiển lên Firebase để đồng bộ App và Thẻ từ
+      Firebase.setBool(fbdo, "/NhaThongMinh/DieuKhien/BatPIR", pirEnabled);
+      digitalWrite(BUZZER_PIN, HIGH); delay(150); digitalWrite(BUZZER_PIN, LOW);
+      
+      // Khi tắt hệ thống (Khoá), đóng cửa ngay lập tức và reset trạng thái
+      if (!pirEnabled) {
+        servo1.write(posClosed);
+        servo2.write(180 - posClosed);
+        isDoorOpenByPIR = false;
+        appControlOpen = false;
+        Firebase.setBool(fbdo, "/NhaThongMinh/DieuKhien/MoCua", false);
+      }
+    }
+    rfid.PICC_HaltA();
+    rfid.PCD_StopCrypto1();
+    rfid.PCD_Init(); 
+  }
+
+  // --- 2. ĐỌC CẢM BIẾN ---
+  float h = dht.readHumidity();
+  float t = dht.readTemperature();
+  int currentGas = analogRead(MQ2_PIN);
+
+  // --- 3. XỬ LÝ GAS (Ưu tiên cao nhất và kêu chuông liên tục) ---
+  if (currentGas > gasThreshold) {
+    isGasAlert = true;
+    servo1.write(posOpen);
+    servo2.write(180 - posOpen);
+    
+    // Tạo tiếng kêu tít tít liên tục không dùng delay() gây treo máy
+    static unsigned long lastBuzzerToggle = 0;
+    if (millis() - lastBuzzerToggle > 200) { // Cứ 200ms đảo trạng thái còi
+      digitalWrite(BUZZER_PIN, !digitalRead(BUZZER_PIN));
+      lastBuzzerToggle = millis();
+    }
+  } else {
+    if (isGasAlert) { // Khi vừa thoát trạng thái báo động
+      digitalWrite(BUZZER_PIN, LOW);
+      servo1.write(posClosed);
+      servo2.write(180 - posClosed);
+      isGasAlert = false;
+    }
+
+    // --- 4. XỬ LÝ PIR (Chỉ chạy khi AN TOAN) ---
+    if (pirEnabled) {
+      if (digitalRead(PIR_PIN) == HIGH) {
+        lastMotionTime = millis(); 
+        if (!isDoorOpenByPIR) {
+          servo1.write(posOpen);
+          servo2.write(180 - posOpen);
+          isDoorOpenByPIR = true;
+          // Tăng số lượng khách và cập nhật lên Firebase
+          totalGuests++;
+          Firebase.setInt(fbdo, "/NhaThongMinh/TongKhach", totalGuests);
+        }
+      } else {
+        if (isDoorOpenByPIR && (millis() - lastMotionTime >= delayTime)) {
+          if (!appControlOpen) { // Chỉ đóng nếu App không yêu cầu mở
+            servo1.write(posClosed);
+            servo2.write(180 - posClosed);
+          }
+          isDoorOpenByPIR = false;
+        }
+      }
+    }
+  }
+
+  // --- 5. CẬP NHẬT MÀN HÌNH ---
+  static unsigned long lastUI = 0;
+  if (millis() - lastUI > 400) { 
+    updateDisplay(t, h, currentGas);
+    lastUI = millis();
+  }
+
+  // --- 6. GỬI DỮ LIỆU FIREBASE ---
+  static unsigned long lastFirebase = 0;
+  if (millis() - lastFirebase > 2000 && WiFi.status() == WL_CONNECTED) {
+    lastFirebase = millis();
+    // Gửi dữ liệu cảm biến và trạng thái
+    Firebase.setFloat(fbdo, "/NhaThongMinh/NhietDo", isnan(t) ? 0 : t);
+    Firebase.setFloat(fbdo, "/NhaThongMinh/DoAm", isnan(h) ? 0 : h);
+    Firebase.setInt(fbdo, "/NhaThongMinh/KhiGas", currentGas);
+    Firebase.setBool(fbdo, "/NhaThongMinh/CanhBaoGas", isGasAlert);
+    Firebase.setBool(fbdo, "/NhaThongMinh/HeThongPIR", pirEnabled);
+  }
+}
