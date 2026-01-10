@@ -1,0 +1,465 @@
+import 'dart:async';
+import 'package:flutter/material.dart';
+import 'package:firebase_core/firebase_core.dart';
+import 'package:firebase_database/firebase_database.dart';
+import 'package:intl/intl.dart';
+import 'firebase_options.dart';
+
+void main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  await Firebase.initializeApp(options: DefaultFirebaseOptions.currentPlatform);
+  runApp(const MyApp());
+}
+
+class MyApp extends StatelessWidget {
+  const MyApp({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      debugShowCheckedModeBanner: false,
+      theme: ThemeData(
+        colorScheme: ColorScheme.fromSeed(seedColor: Colors.blue),
+        useMaterial3: true,
+      ),
+      home: const HomeScreen(),
+    );
+  }
+}
+
+class HomeScreen extends StatefulWidget {
+  const HomeScreen({super.key});
+
+  @override
+  State<HomeScreen> createState() => _HomeScreenState();
+}
+
+class _HomeScreenState extends State<HomeScreen> {
+  final DatabaseReference _dbRef = FirebaseDatabase.instance.ref();
+
+  StreamSubscription? _logicSubscription;
+  bool _lastPirState = false;
+  bool _lastGasState = false; // Để phát hiện cạnh lên của báo động cháy
+  bool _firstRun = true;
+
+  @override
+  void initState() {
+    super.initState();
+    // Lắng nghe Firebase để xử lý logic đếm khách tự động
+    _logicSubscription = _dbRef.child('NhaThongMinh').onValue.listen((event) {
+      if (event.snapshot.value == null) return;
+      final data = Map<dynamic, dynamic>.from(event.snapshot.value as Map);
+
+      // Lấy trạng thái PIR và Gas (Cần ESP32 gửi key 'TrangThaiPIR')
+      bool currentPir = data['TrangThaiPIR'] == true;
+      bool isGasAlert = data['CanhBaoGas'] == true;
+
+      if (!_firstRun) {
+        // Logic: Nếu PIR chuyển từ 0 -> 1 (có người vào) VÀ không phải do Gas báo động
+        if (currentPir && !_lastPirState && !isGasAlert) {
+          int currentTotal = (data['TongKhach'] is int) ? data['TongKhach'] : 0;
+          _dbRef.child('NhaThongMinh/TongKhach').set(currentTotal + 1);
+        }
+
+        // Xử lý lưu lịch sử (Min/Max/Cháy/Khách)
+        _processHistoryLogic(data);
+      }
+      _lastPirState = currentPir;
+      _lastGasState = isGasAlert;
+      _firstRun = false;
+    });
+  }
+
+  @override
+  void dispose() {
+    _logicSubscription?.cancel();
+    super.dispose();
+  }
+
+  // Hàm xử lý logic lưu lịch sử
+  void _processHistoryLogic(Map<dynamic, dynamic> data) async {
+    final String today = DateFormat('yyyy-MM-dd').format(DateTime.now());
+    final DatabaseReference historyRef = _dbRef.child('History/$today');
+
+    // Lấy giá trị hiện tại
+    final double temp = (data['NhietDo'] is num) ? (data['NhietDo'] as num).toDouble() : 0.0;
+    final double hum = (data['DoAm'] is num) ? (data['DoAm'] as num).toDouble() : 0.0;
+    final int gas = (data['KhiGas'] is int) ? data['KhiGas'] : 0;
+    final int totalGuests = (data['TongKhach'] is int) ? data['TongKhach'] : 0;
+    final bool isGasAlert = data['CanhBaoGas'] == true;
+
+    // Lấy dữ liệu lịch sử hiện tại của ngày hôm nay để so sánh
+    final DataSnapshot snapshot = await historyRef.get();
+    
+    if (snapshot.exists) {
+      final historyData = Map<dynamic, dynamic>.from(snapshot.value as Map);
+      
+      // Cập nhật Min/Max Nhiệt độ
+      double maxTemp = (historyData['NhietDo']?['Max'] ?? temp).toDouble();
+      double minTemp = (historyData['NhietDo']?['Min'] ?? temp).toDouble();
+      if (temp > maxTemp) historyRef.child('NhietDo/Max').set(temp);
+      if (temp < minTemp) historyRef.child('NhietDo/Min').set(temp);
+
+      // Cập nhật Min/Max Độ ẩm
+      double maxHum = (historyData['DoAm']?['Max'] ?? hum).toDouble();
+      double minHum = (historyData['DoAm']?['Min'] ?? hum).toDouble();
+      if (hum > maxHum) historyRef.child('DoAm/Max').set(hum);
+      if (hum < minHum) historyRef.child('DoAm/Min').set(hum);
+
+      // Cập nhật Min/Max Khí Gas
+      int maxGas = (historyData['KhiGas']?['Max'] ?? gas).toInt();
+      int minGas = (historyData['KhiGas']?['Min'] ?? gas).toInt();
+      if (gas > maxGas) historyRef.child('KhiGas/Max').set(gas);
+      if (gas < minGas) historyRef.child('KhiGas/Min').set(gas);
+
+      // Cập nhật số lần cháy (Chỉ cộng khi chuyển từ Không -> Có báo động)
+      if (isGasAlert && !_lastGasState) {
+        int fireCount = (historyData['SoLanChay'] ?? 0) + 1;
+        historyRef.child('SoLanChay').set(fireCount);
+      }
+
+      // Cập nhật tổng khách (Luôn đồng bộ với hiện tại)
+      historyRef.child('TongKhach').set(totalGuests);
+
+    } else {
+      // Nếu chưa có dữ liệu ngày hôm nay, tạo mới
+      historyRef.set({
+        'TongKhach': totalGuests,
+        'SoLanChay': isGasAlert ? 1 : 0,
+        'NhietDo': {'Max': temp, 'Min': temp},
+        'DoAm': {'Max': hum, 'Min': hum},
+        'KhiGas': {'Max': gas, 'Min': gas},
+        'Timestamp': ServerValue.timestamp,
+      });
+    }
+  }
+
+  // Hàm format giá trị hiển thị
+  String _formatValue(dynamic val, {String suffix = ""}) {
+    if (val == null) return "0";
+    if (val is double) return val.toInt().toString();
+    if (val is int) return val.toString();
+    return val.toString().split('.')[0] + suffix;
+  }
+
+  // Hàm reset tổng khách (ví dụ: qua ngày mới)
+  void _resetDailyCounter() {
+    _dbRef.child('NhaThongMinh/TongKhach').set(0);
+    _dbRef.child('NhaThongMinh/KhachHienTai').set(0);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: Colors.grey[100],
+      appBar: AppBar(
+        title: const Text("Quản Lý Cửa Hàng", style: TextStyle(fontWeight: FontWeight.bold)),
+        centerTitle: true,
+        backgroundColor: Theme.of(context).colorScheme.primaryContainer,
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.history),
+            tooltip: "Xem lịch sử",
+            onPressed: () {
+              Navigator.push(context, MaterialPageRoute(builder: (context) => const HistoryScreen()));
+            },
+          ),
+          IconButton(
+            icon: const Icon(Icons.refresh),
+            tooltip: "Reset đếm khách",
+            onPressed: _resetDailyCounter,
+          )
+        ],
+      ),
+      body: StreamBuilder(
+        // Lắng nghe node NhaThongMinh theo đúng cấu trúc code ESP32
+        stream: _dbRef.child('NhaThongMinh').onValue,
+        builder: (context, AsyncSnapshot<DatabaseEvent> snapshot) {
+          if (snapshot.hasData && snapshot.data!.snapshot.value != null) {
+            final Map<dynamic, dynamic> data = Map<dynamic, dynamic>.from(
+                snapshot.data!.snapshot.value as Map);
+
+            // Parse dữ liệu từ Firebase (khớp với code ESP32)
+            final double temp = (data['NhietDo'] is num) ? (data['NhietDo'] as num).toDouble() : 0.0;
+            final double hum = (data['DoAm'] is num) ? (data['DoAm'] as num).toDouble() : 0.0;
+            final int gas = (data['KhiGas'] is int) ? data['KhiGas'] : 0;
+            final bool isGasAlert = data['CanhBaoGas'] == true;
+            final bool pirEnabled = data['HeThongPIR'] == true;
+            
+            // Dữ liệu đếm khách (App tự quản lý thêm)
+            final int totalGuests = (data['TongKhach'] is int) ? data['TongKhach'] : 0;
+
+            return SingleChildScrollView(
+              padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 25),
+              child: Column(
+                children: [
+                  // 1. Cảnh báo nguy hiểm (Ưu tiên cao nhất)
+                  if (isGasAlert)
+                    Container(
+                      margin: const EdgeInsets.only(bottom: 20),
+                      padding: const EdgeInsets.all(15),
+                      decoration: BoxDecoration(
+                        color: Colors.redAccent,
+                        borderRadius: BorderRadius.circular(15),
+                        boxShadow: [BoxShadow(color: Colors.red.withOpacity(0.4), blurRadius: 10, spreadRadius: 2)],
+                      ),
+                      child: Row(
+                        children: const [
+                          Icon(Icons.warning_amber_rounded, color: Colors.white, size: 40),
+                          SizedBox(width: 15),
+                          Expanded(
+                            child: Text(
+                              "CẢNH BÁO: RÒ RỈ GAS!\nHệ thống cửa đã mở khẩn cấp.",
+                              style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 16),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+
+                  // 2. Thẻ thông tin môi trường
+                  Row(
+                    children: [
+                      Expanded(child: _buildSensorCard("Nhiệt độ", "${temp.toStringAsFixed(1)}°C", Icons.thermostat, Colors.orange)),
+                      const SizedBox(width: 15),
+                      Expanded(child: _buildSensorCard("Độ ẩm", "${hum.toStringAsFixed(1)}%", Icons.water_drop, Colors.blue)),
+                    ],
+                  ),
+                  
+                  const SizedBox(height: 15),
+
+                  // 3. Thẻ nồng độ Gas
+                  _buildGasCard(gas),
+
+                  const SizedBox(height: 25),
+                  const Text("QUẢN LÝ KHÁCH HÀNG", style: TextStyle(fontSize: 14, fontWeight: FontWeight.bold, color: Colors.grey)),
+                  const SizedBox(height: 10),
+
+                  // 4. Bộ đếm khách hàng
+                  Container(
+                    padding: const EdgeInsets.all(20),
+                    decoration: BoxDecoration(
+                      color: Colors.white,
+                      borderRadius: BorderRadius.circular(20),
+                      boxShadow: [BoxShadow(color: Colors.black.withOpacity(0.03), blurRadius: 10, offset: const Offset(0, 5))]
+                    ),
+                    width: double.infinity,
+                    alignment: Alignment.center,
+                    child: _buildAutoCounter("Tổng khách hôm nay", totalGuests, Colors.purple),
+                  ),
+
+                  const SizedBox(height: 25),
+                  const Text("HỆ THỐNG AN NINH", style: TextStyle(fontSize: 14, fontWeight: FontWeight.bold, color: Colors.grey)),
+                  const SizedBox(height: 10),
+
+                  // 5. Điều khiển hệ thống PIR
+                  _buildControlSwitch(
+                    "Trạng thái hệ thống", 
+                    pirEnabled, 
+                    Colors.teal, 
+                    () => _dbRef.child('NhaThongMinh/DieuKhien/BatPIR').set(!pirEnabled)
+                  ),
+                ],
+              ),
+            );
+          }
+          return const Center(child: CircularProgressIndicator());
+        },
+      ),
+    );
+  }
+
+  Widget _buildSensorCard(String title, String value, IconData icon, Color color) {
+    return Container(
+      padding: const EdgeInsets.all(15),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(20),
+        boxShadow: [
+          BoxShadow(color: Colors.black.withOpacity(0.03), blurRadius: 10, offset: const Offset(0, 5))
+        ]
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Container(
+            padding: const EdgeInsets.all(10),
+            decoration: BoxDecoration(
+              color: color.withOpacity(0.1),
+              borderRadius: BorderRadius.circular(12),
+            ),
+            child: Icon(icon, color: color, size: 28),
+          ),
+          const SizedBox(height: 15),
+          Text(
+            value,
+            style: const TextStyle(fontSize: 26, fontWeight: FontWeight.bold, letterSpacing: -0.5),
+          ),
+          const SizedBox(height: 5),
+          Text(title, style: const TextStyle(fontSize: 14, color: Colors.grey, fontWeight: FontWeight.w500)),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildGasCard(int gasValue) {
+    Color statusColor = gasValue > 1200 ? Colors.red : Colors.green;
+    String statusText = gasValue > 1200 ? "NGUY HIỂM" : "An toàn";
+
+    return Container(
+      padding: const EdgeInsets.all(15),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(20),
+        boxShadow: [BoxShadow(color: Colors.black.withOpacity(0.03), blurRadius: 10, offset: const Offset(0, 5))]
+      ),
+      child: Row(
+        children: [
+          Container(
+            padding: const EdgeInsets.all(10),
+            decoration: BoxDecoration(color: Colors.grey[100], borderRadius: BorderRadius.circular(12)),
+            child: const Icon(Icons.cloud, color: Colors.grey, size: 28),
+          ),
+          const SizedBox(width: 15),
+          Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text("Nồng độ Khí Gas", style: TextStyle(fontSize: 14, color: Colors.grey, fontWeight: FontWeight.w500)),
+              Text("$gasValue ppm", style: const TextStyle(fontSize: 20, fontWeight: FontWeight.bold)),
+            ],
+          ),
+          const Spacer(),
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+            decoration: BoxDecoration(
+              color: statusColor.withOpacity(0.1),
+              borderRadius: BorderRadius.circular(20),
+              border: Border.all(color: statusColor),
+            ),
+            child: Text(statusText, style: TextStyle(color: statusColor, fontWeight: FontWeight.bold)),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildAutoCounter(String label, int count, Color color) {
+    return Column(
+      children: [
+        Text(label, style: const TextStyle(fontSize: 14, color: Colors.grey)),
+        const SizedBox(height: 5),
+        Text("$count", style: TextStyle(fontSize: 32, fontWeight: FontWeight.bold, color: color)),
+        const SizedBox(height: 5),
+        const Text("Tự động đếm", style: TextStyle(fontSize: 12, color: Colors.grey, fontStyle: FontStyle.italic)),
+      ],
+    );
+  }
+
+  Widget _buildControlSwitch(String title, bool value, Color color, VoidCallback onToggle) {
+    return Container(
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(20),
+        boxShadow: [BoxShadow(color: Colors.black.withOpacity(0.05), blurRadius: 10, spreadRadius: 1)]
+      ),
+      child: SwitchListTile(
+        contentPadding: const EdgeInsets.symmetric(horizontal: 20, vertical: 5),
+        secondary: CircleAvatar(
+          backgroundColor: value ? color.withOpacity(0.2) : Colors.grey[200],
+          child: Icon(Icons.power_settings_new, color: value ? color : Colors.grey),
+        ),
+        title: Text(title, style: const TextStyle(fontWeight: FontWeight.bold)),
+        subtitle: Text(value ? "Hệ thống đang hoạt động" : "Đã vô hiệu hóa (Khóa cửa)"),
+        value: value,
+        onChanged: (val) => onToggle(),
+        activeColor: color,
+      ),
+    );
+  }
+}
+
+class HistoryScreen extends StatelessWidget {
+  const HistoryScreen({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    final DatabaseReference dbRef = FirebaseDatabase.instance.ref();
+
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text("Lịch Sử Hoạt Động"),
+        backgroundColor: Theme.of(context).colorScheme.primaryContainer,
+      ),
+      body: StreamBuilder(
+        stream: dbRef.child('History').limitToLast(10).onValue,
+        builder: (context, AsyncSnapshot<DatabaseEvent> snapshot) {
+          if (snapshot.hasData && snapshot.data!.snapshot.value != null) {
+            Map<dynamic, dynamic> rawMap = Map<dynamic, dynamic>.from(snapshot.data!.snapshot.value as Map);
+            
+            List<MapEntry<dynamic, dynamic>> list = rawMap.entries.toList();
+            list.sort((a, b) => b.key.compareTo(a.key));
+
+            return ListView.builder(
+              padding: const EdgeInsets.all(16),
+              itemCount: list.length,
+              itemBuilder: (context, index) {
+                String date = list[index].key;
+                Map data = list[index].value;
+                
+                int guests = data['TongKhach'] ?? 0;
+                int fires = data['SoLanChay'] ?? 0;
+                
+                String tMax = (data['NhietDo']?['Max'] ?? 0).toString();
+                String tMin = (data['NhietDo']?['Min'] ?? 0).toString();
+                String hMax = (data['DoAm']?['Max'] ?? 0).toString();
+                String hMin = (data['DoAm']?['Min'] ?? 0).toString();
+                String gMax = (data['KhiGas']?['Max'] ?? 0).toString();
+
+                return Container(
+                  margin: const EdgeInsets.only(bottom: 15),
+                  padding: const EdgeInsets.all(15),
+                  decoration: BoxDecoration(
+                    color: Colors.white,
+                    borderRadius: BorderRadius.circular(15),
+                    border: Border.all(color: Colors.grey.shade200),
+                    boxShadow: [BoxShadow(color: Colors.black.withOpacity(0.03), blurRadius: 5, offset: const Offset(0, 2))],
+                  ),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Row(
+                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                        children: [
+                          Text("Ngày: $date", style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 16, color: Colors.blue)),
+                          if (fires > 0)
+                            Container(
+                              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                              decoration: BoxDecoration(color: Colors.red[100], borderRadius: BorderRadius.circular(8)),
+                              child: Text("🔥 $fires lần cháy", style: const TextStyle(color: Colors.red, fontWeight: FontWeight.bold, fontSize: 12)),
+                            ),
+                        ],
+                      ),
+                      const Divider(),
+                      Row(
+                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                        children: [
+                          Text("Khách: $guests người", style: const TextStyle(fontWeight: FontWeight.bold)),
+                          const Text("|", style: TextStyle(color: Colors.grey)),
+                          Text("Gas Max: $gMax", style: TextStyle(color: int.parse(gMax) > 1000 ? Colors.red : Colors.black)),
+                        ],
+                      ),
+                      const SizedBox(height: 8),
+                      Text("Nhiệt độ: $tMin - $tMax °C", style: const TextStyle(fontSize: 13, color: Colors.grey)),
+                      Text("Độ ẩm: $hMin - $hMax %", style: const TextStyle(fontSize: 13, color: Colors.grey)),
+                    ],
+                  ),
+                );
+              },
+            );
+          }
+          return const Center(child: Text("Chưa có dữ liệu lịch sử", style: TextStyle(color: Colors.grey)));
+        },
+      ),
+    );
+  }
+}
